@@ -219,11 +219,36 @@ class ICAE(torch.nn.Module):
     
     
     def tokens_to_embeddings(self, token_ids):   # input_tokens can be either normal tokens and special tokens
-        embeddings = self.icae.get_base_model().model.embed_tokens(token_ids)
+        # Get the base embedding layer and its vocabulary size
+        base_embedding_layer = self.icae.get_base_model().model.embed_tokens
+        base_vocab_size = base_embedding_layer.weight.size(0)
+
+        # Clamp token IDs to the valid range of the base embedding layer
+        token_ids = torch.clamp(token_ids, 0, base_vocab_size - 1)
+
+        # Compute embeddings for all tokens
+        embeddings = base_embedding_layer(token_ids)
+
+        # Identify special tokens
         special_flags = token_ids >= self.vocab_size
-        embeddings[special_flags] = self.memory_token_embed(token_ids[special_flags] - self.vocab_size).to(embeddings)    # replace special token's embedding from self.memory_token_embed
+
+        if special_flags.any():
+            # Get the indices for special tokens in the memory token embedding
+            special_token_indices = token_ids[special_flags] - self.vocab_size
+
+            # Check if the indices are within the valid range of the memory token embedding
+            memory_embedding_size = self.memory_token_embed.weight.size(0)
+            special_token_indices = torch.clamp(special_token_indices, 0, memory_embedding_size - 1)
+
+            # Replace special token embeddings
+            embeddings[special_flags] = self.memory_token_embed(special_token_indices).to(embeddings)
+
         return embeddings
-        
+    # def tokens_to_embeddings(self, token_ids):   # input_tokens can be either normal tokens and special tokens
+    #     embeddings = self.icae.get_base_model().model.embed_tokens(token_ids)
+    #     special_flags = token_ids >= self.vocab_size
+    #     embeddings[special_flags] = self.memory_token_embed(token_ids[special_flags] - self.vocab_size).to(embeddings)    # replace special token's embedding from self.memory_token_embed
+    #     return embeddings       
     
     def _compress(
         self,

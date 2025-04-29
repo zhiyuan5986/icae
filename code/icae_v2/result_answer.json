@@ -1,0 +1,24 @@
+{
+    "0": {
+        "pred": "Saltram lives in a flat in Ebury Street.",
+        "answers": [
+            "He is a guest in the home of the Mulvilles."
+        ],
+        "model_name": "/home/qiaoan/data/llama-2-7b-chat/models--unsloth--llama-2-7b-chat/snapshots/a6d63d7c9ac31fd7e6d31e66ee0d1c784a489fcf",
+        "task": "narrativeqa",
+        "idx": 0,
+        "all_classes": null,
+        "length": 22692
+    },
+    "1": {
+        "pred": "Ann does not return Mary's feelings of affection because she is apathetic.",
+        "answers": [
+            "Because she is in unrequited love with someone else"
+        ],
+        "model_name": "/home/qiaoan/data/llama-2-7b-chat/models--unsloth--llama-2-7b-chat/snapshots/a6d63d7c9ac31fd7e6d31e66ee0d1c784a489fcf",
+        "task": "narrativeqa",
+        "idx": 1,
+        "all_classes": null,
+        "length": 23316
+    }
+}

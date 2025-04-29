@@ -60,6 +60,8 @@ with torch.no_grad():
             prompt_left_ids =  torch.LongTensor([[1, 733, 16289, 28793]]).to(device)
             prompt_right_ids = [model.ft_token_id] + tokenized_prompt['input_ids'] + [733, 28748, 16289, 28793]
             prompt_right_ids = torch.LongTensor([prompt_right_ids]).to(device)
+            print("left:", model.tokenizer.decode(torch.LongTensor([1, 733, 16289, 28793])))
+            print("right:", model.tokenizer.decode(torch.LongTensor([733, 28748, 16289, 28793])))
 
             prompt_left_embs = model.tokens_to_embeddings(prompt_left_ids)
             prompt_right_embs = model.tokens_to_embeddings(prompt_right_ids)
