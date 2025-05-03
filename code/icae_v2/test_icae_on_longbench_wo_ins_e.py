@@ -155,65 +155,61 @@ all_datasets = [
     'triviaqa',
     'samsum',
 ]
+# if args.e:
+#     all_datasets = [
+#         "qasper_e", 
+#         "multifieldqa_en_e", 
+        
+#         "hotpotqa_e", 
+#         "2wikimqa_e", 
+        
+#         "gov_report_e",  
+#         "multi_news_e",
+
+#         'lcc_e',
+#         'repobench-p_e',
+
+#         'passage_count_e',
+#         'passage_retrieval_en_e',
+
+#         'trec_e',
+#         'triviaqa_e',
+#         'samsum_e',
+#     ]
 datasets = all_datasets
 if args.datasets != 'all':
     datasets = args.datasets.split(',')
+dataset2question = {
+    'multi_news': 'You are given several news passages. Write a one-page summary of all news.',
+    'gov_report': 'Write a one-page summary of the report.',
+    'lcc': 'What is the next line for the code given below?',
+    'passage_count': 'How many unique paragraphs there are after removing duplicated paragraphs?',
+    'passage_count': 'Does this sentence contains meaningful information?',
 
+    'lcc': 'What is the next line of code?',
+    'repobench-p': 'What is the next line of code?',
+}
 samples = []
 for dataset_name in tqdm(datasets):
     if 'zh' in dataset_name or dataset_name in ['lsht']:
         continue
     # dataset = load_dataset('THUDM/LongBench', dataset_name, split='test')
-    dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}.jsonl', split = 'train')
-    for d in dataset:
-        d['input_is_null'] = (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '')
-        if (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '') and dataset_name not in dataset2question:
-            continue
-        d['task'] = dataset_name
-        d['idx'] = len(samples)
-        samples.append(d)
+    dataset = None
+    if args.e:
+        if os.path.exists(f'{args.load_origin_from}/{dataset_name}_e.jsonl'):
+            dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}_e.jsonl', split = 'train')
+    else:
+        dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}.jsonl', split = 'train')
+    if dataset:
+        for d in dataset:
+            d['input_is_null'] = (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '')
+            if (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '') and dataset_name not in dataset2question:
+                continue
+            d['task'] = dataset_name
+            d['idx'] = len(samples)
+            d['question'] = dataset2question.get(dataset_name, d['input'])
+            samples.append(d)
 
-eng_datasets = [
-    "narrativeqa",
-    "qasper",
-    "multifieldqa_en",
-    "hotpotqa",
-    "2wikimqa",
-    "musique",
-    "gov_report",
-    "qmsum",
-    "multi_news",
-    "trec",
-    "triviaqa",
-    "samsum",
-    "passage_count",
-    "passage_retrieval_en",
-    "lcc",
-    "repobench-p",
-]
-# all_datasets = [
-#     "narrativeqa",
-#     "qasper",
-#     "multifieldqa_en",
-#     "multifieldqa_zh",
-#     "hotpotqa",
-#     "2wikimqa",
-#     "musique",
-#     "dureader",
-#     "gov_report",
-#     "qmsum",
-#     "multi_news",
-#     "vcsum",
-#     "trec",
-#     "triviaqa",
-#     "samsum",
-#     "lsht",
-#     "passage_count",
-#     "passage_retrieval_en",
-#     "passage_retrieval_zh",
-#     "lcc",
-#     "repobench-p",
-# ]
 
 
 def scorer_e(dataset, predictions, answers, lengths, all_classes):
@@ -298,7 +294,10 @@ def eval(load_path):
             answers[task],
             lengths[task],
         )
-        score = scorer(task, pred_list, ans_list, all_classes[task])
+        if args.e:
+            score = scorer_e(task, pred_list, ans_list, length_list, all_classes[task])
+        else:
+            score = scorer(task, pred_list, ans_list, all_classes[task])
         print(score)
         scores[task] = {"score": score, "num": len(pred_list)}
     score_list = [s["score"] for s in scores.values()]
@@ -483,17 +482,17 @@ def predict():
         new_sample = {}
         new_sample["context"] = sample[args.load_key]
         new_sample["input"] = sample["input"]
-        # new_sample["input"] = sample["question"]
+        new_sample["question"] = sample["question"]
 
         # prompt_format = dataset2prompt[sample["task"]]
         max_gen = int(dataset2maxlen[sample["task"]])
         # prompt = prompt_format.format(**new_sample)
         # token_ids = tokenizer.encode(prompt)
         
-        prompt_left = "<s>[INST]" + dataset2instruction[task]
-        prompt_right = dataset2questiontemplate[task].format(**new_sample)
-        # tokenized_input = model.tokenizer(new_sample['context'], truncation=True, max_length=5120, padding=False, return_attention_mask=False)
-        tokenized_input = model.tokenizer(new_sample['context'], padding=False, return_attention_mask=False)
+        prompt_left = "<s>▁[INST]" 
+        prompt_right = new_sample["question"]
+        tokenized_input = model.tokenizer(new_sample['context'], truncation=True, max_length=training_args.model_max_length, padding=False, return_attention_mask=False)
+        # tokenized_input = model.tokenizer(new_sample['context'], padding=False, return_attention_mask=False)
         input_ids = torch.LongTensor([tokenized_input['input_ids']]).to(device)
         memory_slots = model._compress_target(input_ids, is_training=False, target_tokens=args.target_tokens)
         prompt_left_ids = model.tokenizer(prompt_left, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -529,27 +528,30 @@ def predict():
         # os.system("nvidia-smi | grep python")
 
         generate_text = []
+        past_key_values = None
         # Generate text output
         for i in range(dataset2maxlen[task]):
             # os.system("nvidia-smi | grep python")
             with model.icae.disable_adapter():   # no independent decoder; use self.icae
                 with torch.no_grad():
-                    out = model.icae(inputs_embeds=output, use_cache=False)
+                    out = model.icae(inputs_embeds=output, use_cache=True, past_key_values=past_key_values)
             logit = out.logits[:, -1, :model.vocab_size-1]
             # os.system("nvidia-smi | grep python")
-            del out
-            torch.cuda.empty_cache()
             # os.system("nvidia-smi | grep python")
-            # past_key_values = out.past_key_values
+            past_key_values = out.past_key_values
 
             next_token_id = torch.argmax(logit, dim=-1)
+            # print(next_token_id)
             
             if next_token_id.item() == 2:   # eos
                 break
             # print(output.shape)
             # print(model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).shape)
-            output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            # output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            output = model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)
             generate_text.append(next_token_id.item())
+
+        # pred = model.tokenizer.decode(generate_text)
 
         pred = model.tokenizer.decode(generate_text).strip().split("\n\n")[0].split("<s>")[0].strip()
 

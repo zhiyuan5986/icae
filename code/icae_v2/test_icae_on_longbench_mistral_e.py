@@ -25,6 +25,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, HfArgu
 from peft import LoraConfig
 from modeling_icae_multi_span import ICAE, ModelArguments, DataArguments, TrainingArguments
 from datasets import load_dataset
+from safetensors.torch import load_file
 # from util.util import load_model_and_tokenizer, query_llm
 
 # def query_llm(
@@ -158,20 +159,36 @@ all_datasets = [
 datasets = all_datasets
 if args.datasets != 'all':
     datasets = args.datasets.split(',')
+dataset2question = {
+    'multi_news': 'You are given several news passages. Write a one-page summary of all news.',
+    'gov_report': 'Write a one-page summary of the report.',
+    'lcc': 'What is the next line for the code given below?',
+    'passage_count': 'How many unique paragraphs there are after removing duplicated paragraphs?',
+    'passage_count': 'Does this sentence contains meaningful information?',
 
+    'lcc': 'What is the next line of code?',
+    'repobench-p': 'What is the next line of code?',
+}
 samples = []
 for dataset_name in tqdm(datasets):
     if 'zh' in dataset_name or dataset_name in ['lsht']:
         continue
     # dataset = load_dataset('THUDM/LongBench', dataset_name, split='test')
-    dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}.jsonl', split = 'train')
-    for d in dataset:
-        d['input_is_null'] = (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '')
-        if (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '') and dataset_name not in dataset2question:
-            continue
-        d['task'] = dataset_name
-        d['idx'] = len(samples)
-        samples.append(d)
+    dataset = None
+    if args.e:
+        if os.path.exists(f'{args.load_origin_from}/{dataset_name}_e.jsonl'):
+            dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}_e.jsonl', split = 'train')
+    else:
+        dataset = load_dataset(path = 'json', data_files=f'{args.load_origin_from}/{dataset_name}.jsonl', split = 'train')
+    if dataset:
+        for d in dataset:
+            d['input_is_null'] = (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '')
+            if (not d['input'] or d['input'][0] is None or d['input'][0].strip() == '') and dataset_name not in dataset2question:
+                continue
+            d['task'] = dataset_name
+            d['idx'] = len(samples)
+            d['question'] = dataset2question.get(dataset_name, d['input'])
+            samples.append(d)
 
 eng_datasets = [
     "narrativeqa",
@@ -298,7 +315,10 @@ def eval(load_path):
             answers[task],
             lengths[task],
         )
-        score = scorer(task, pred_list, ans_list, all_classes[task])
+        if args.e:
+            score = scorer_e(task, pred_list, ans_list, length_list, all_classes[task])
+        else:
+            score = scorer(task, pred_list, ans_list, all_classes[task])
         print(score)
         scores[task] = {"score": score, "num": len(pred_list)}
     score_list = [s["score"] for s in scores.values()]
@@ -413,7 +433,7 @@ def predict():
     
     # Define Lora configuration
     lora_config = LoraConfig(
-        r=128,
+        r=512,
         lora_alpha=32,
         lora_dropout=model_args.lora_dropout,
         bias="none",
@@ -424,28 +444,11 @@ def predict():
     model = ICAE(model_args, training_args, lora_config)
     device = 'cuda'
 
-    def load_model_with_adjustments(model, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        model_state_dict = model.state_dict()
+    print(f"Loading trained checkpoint from {training_args.output_dir}")
+    state_dict = load_file(training_args.output_dir)
+    model.load_state_dict(state_dict, strict=False) # only load lora and memory token embeddings
 
-        for name, param in checkpoint.items():
-            if name in model_state_dict:
-                if isinstance(param, torch.Tensor) and param.shape == model_state_dict[name].shape:
-                    model_state_dict[name] = param
-                else:
-                    if not isinstance(param, torch.Tensor):
-                        print(f"Skipping {name} because it's not a torch.Tensor (received {type(param)})")
-                        # model_state_dict[name] = torch.Tensor(param)
-                    else:
-                        print(f"Skipping {name} due to size mismatch. Checkpoint shape: {param.shape}, Model shape: {model_state_dict[name].shape}")
-            else:
-                print(f"Unexpected parameter {name} in checkpoint")
-
-        model.load_state_dict(model_state_dict, strict=False)
-        return model
-
-    model = load_model_with_adjustments(model, training_args.output_dir)
-
+    model = model.to(device)
     # Move the model to GPU
     # model = model.to(device)
     model.eval()
@@ -483,21 +486,28 @@ def predict():
         new_sample = {}
         new_sample["context"] = sample[args.load_key]
         new_sample["input"] = sample["input"]
-        # new_sample["input"] = sample["question"]
+        new_sample["question"] = sample["question"]
 
         # prompt_format = dataset2prompt[sample["task"]]
         max_gen = int(dataset2maxlen[sample["task"]])
         # prompt = prompt_format.format(**new_sample)
         # token_ids = tokenizer.encode(prompt)
         
-        prompt_left = "<s>[INST]" + dataset2instruction[task]
-        prompt_right = dataset2questiontemplate[task].format(**new_sample)
+        prompt_left = "<s>▁[INST]" 
+        prompt_right = new_sample["question"]
+        # print(prompt_right)
         # tokenized_input = model.tokenizer(new_sample['context'], truncation=True, max_length=5120, padding=False, return_attention_mask=False)
         tokenized_input = model.tokenizer(new_sample['context'], padding=False, return_attention_mask=False)
         input_ids = torch.LongTensor([tokenized_input['input_ids']]).to(device)
         memory_slots = model._compress_target(input_ids, is_training=False, target_tokens=args.target_tokens)
         prompt_left_ids = model.tokenizer(prompt_left, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        # prompt_left_ids = torch.LongTensor([[1, 733, 16289, 28793]]).to(device)
         prompt_right_ids = torch.cat([torch.LongTensor([[model.ft_token_id]]), model.tokenizer(prompt_right, add_special_tokens=False, return_tensors="pt").input_ids, model.tokenizer("[/INST]", add_special_tokens=False, return_tensors="pt").input_ids], dim=1).to(device)
+        # prompt_right_ids = [model.ft_token_id] + model.tokenizer(prompt_right, truncation=False, padding=False, return_attention_mask=False, add_special_tokens=False)['input_ids'] + [733, 28748, 16289, 28793]
+        # prompt_right_ids = torch.LongTensor([prompt_right_ids]).to(device)
+        # prompt_left_ids[1] = 773
+        # print(prompt_left_ids)
+        # print(prompt_right_ids)
         
         prompt_left_embs = model.tokens_to_embeddings(prompt_left_ids)
         prompt_right_embs = model.tokens_to_embeddings(prompt_right_ids)
@@ -529,29 +539,30 @@ def predict():
         # os.system("nvidia-smi | grep python")
 
         generate_text = []
+        past_key_values = None
         # Generate text output
         for i in range(dataset2maxlen[task]):
             # os.system("nvidia-smi | grep python")
             with model.icae.disable_adapter():   # no independent decoder; use self.icae
                 with torch.no_grad():
-                    out = model.icae(inputs_embeds=output, use_cache=False)
+                    out = model.icae(inputs_embeds=output, use_cache=True, past_key_values=past_key_values)
             logit = out.logits[:, -1, :model.vocab_size-1]
             # os.system("nvidia-smi | grep python")
-            del out
-            torch.cuda.empty_cache()
             # os.system("nvidia-smi | grep python")
-            # past_key_values = out.past_key_values
+            past_key_values = out.past_key_values
 
             next_token_id = torch.argmax(logit, dim=-1)
+            # print(next_token_id)
             
             if next_token_id.item() == 2:   # eos
                 break
             # print(output.shape)
             # print(model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).shape)
-            output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            # output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            output = model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)
             generate_text.append(next_token_id.item())
 
-        pred = model.tokenizer.decode(generate_text).strip().split("\n\n")[0].split("<s>")[0].strip()
+        pred = model.tokenizer.decode(generate_text)
 
         # with model.icae.disable_adapter():
         #     out = model.icae.generate(inputs_embeds=decoder_input_embeddings, max_new_tokens=max_gen, use_cache=True, eos_token_id=2)

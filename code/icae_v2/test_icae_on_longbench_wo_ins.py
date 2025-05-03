@@ -158,7 +158,16 @@ all_datasets = [
 datasets = all_datasets
 if args.datasets != 'all':
     datasets = args.datasets.split(',')
+dataset2question = {
+    'multi_news': 'You are given several news passages. Write a one-page summary of all news.',
+    'gov_report': 'Write a one-page summary of the report.',
+    'lcc': 'What is the next line for the code given below?',
+    'passage_count': 'How many unique paragraphs there are after removing duplicated paragraphs?',
+    'passage_count': 'Does this sentence contains meaningful information?',
 
+    'lcc': 'What is the next line of code?',
+    'repobench-p': 'What is the next line of code?',
+}
 samples = []
 for dataset_name in tqdm(datasets):
     if 'zh' in dataset_name or dataset_name in ['lsht']:
@@ -171,6 +180,7 @@ for dataset_name in tqdm(datasets):
             continue
         d['task'] = dataset_name
         d['idx'] = len(samples)
+        d['question'] = dataset2question.get(dataset_name, d['input'])
         samples.append(d)
 
 eng_datasets = [
@@ -483,15 +493,15 @@ def predict():
         new_sample = {}
         new_sample["context"] = sample[args.load_key]
         new_sample["input"] = sample["input"]
-        # new_sample["input"] = sample["question"]
+        new_sample["question"] = sample["question"]
 
         # prompt_format = dataset2prompt[sample["task"]]
         max_gen = int(dataset2maxlen[sample["task"]])
         # prompt = prompt_format.format(**new_sample)
         # token_ids = tokenizer.encode(prompt)
         
-        prompt_left = "<s>[INST]" + dataset2instruction[task]
-        prompt_right = dataset2questiontemplate[task].format(**new_sample)
+        prompt_left = "<s>▁[INST]" 
+        prompt_right = new_sample["question"]
         # tokenized_input = model.tokenizer(new_sample['context'], truncation=True, max_length=5120, padding=False, return_attention_mask=False)
         tokenized_input = model.tokenizer(new_sample['context'], padding=False, return_attention_mask=False)
         input_ids = torch.LongTensor([tokenized_input['input_ids']]).to(device)
@@ -529,27 +539,30 @@ def predict():
         # os.system("nvidia-smi | grep python")
 
         generate_text = []
+        past_key_values = None
         # Generate text output
         for i in range(dataset2maxlen[task]):
             # os.system("nvidia-smi | grep python")
             with model.icae.disable_adapter():   # no independent decoder; use self.icae
                 with torch.no_grad():
-                    out = model.icae(inputs_embeds=output, use_cache=False)
+                    out = model.icae(inputs_embeds=output, use_cache=True, past_key_values=past_key_values)
             logit = out.logits[:, -1, :model.vocab_size-1]
             # os.system("nvidia-smi | grep python")
-            del out
-            torch.cuda.empty_cache()
             # os.system("nvidia-smi | grep python")
-            # past_key_values = out.past_key_values
+            past_key_values = out.past_key_values
 
             next_token_id = torch.argmax(logit, dim=-1)
+            # print(next_token_id)
             
             if next_token_id.item() == 2:   # eos
                 break
             # print(output.shape)
             # print(model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).shape)
-            output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            # output = torch.cat([output, model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)], dim=1)
+            output = model.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(device)
             generate_text.append(next_token_id.item())
+
+        # pred = model.tokenizer.decode(generate_text)
 
         pred = model.tokenizer.decode(generate_text).strip().split("\n\n")[0].split("<s>")[0].strip()
 

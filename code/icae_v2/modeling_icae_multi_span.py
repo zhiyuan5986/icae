@@ -99,12 +99,25 @@ class ICAE(torch.nn.Module):
         self.model_args = model_args
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
-        self.icae = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16, use_flash_attention_2=True, resume_download=True)
+        
+        # Replace use_flash_attention_2 with attn_implementation
+        self.icae = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            resume_download=True,
+            device_map="cuda:0",
+        )
         
         self.training = self.model_args.train    
         
         if self.training:    # indepedent model for gradient checkpointing
-            self.decoder = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16, use_flash_attention_2=True, resume_download=True)
+            self.decoder = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16 if training_args.bf16 is False else torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                resume_download=True
+            )
 
         self.vocab_size = self.icae.config.vocab_size + 1    # [PAD] token
         self.pad_token_id = self.vocab_size - 1
@@ -130,7 +143,7 @@ class ICAE(torch.nn.Module):
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.memory_token_embed = nn.Embedding(self.mem_size + 3, self.dim, padding_idx=None)
+        self.memory_token_embed = nn.Embedding(self.mem_size + 3, self.dim, padding_idx=None).to(device)
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
         self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=device).unsqueeze(0)    # mem tokens
@@ -252,9 +265,11 @@ class ICAE(torch.nn.Module):
     
     def _compress(
         self,
-        input_ids: torch.LongTensor = None
+        input_ids: torch.LongTensor = None,
+        is_training: bool = True,
     ):  # for inference; compress a fixed length of input into memory slots
-
+        # print("Before compress: ")
+        # os.system("nvidia-smi | grep python")
         batch_size = input_ids.size(0)
         total_length = input_ids.size(1)
         num_segments = self.compute_num_segments(total_length)
@@ -262,6 +277,7 @@ class ICAE(torch.nn.Module):
         
         max_compressed_length = num_segments * self.mem_size
         compress_outputs = torch.zeros((max_compressed_length, self.dim))
+        # compress_outputs = None
         
         for segment_idx in range(num_segments):
             start_idx = segment_idx * segment_length
@@ -274,13 +290,75 @@ class ICAE(torch.nn.Module):
             segment_input_embedding[mem_flag] = self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding)
 
             # compress the current segment
-            segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
+            if is_training:
+                segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
+            else:
+                with torch.no_grad():
+                    segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
             segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
 
             # collect memory tokens
             compress_outputs[segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = segment_compress_outputs[mem_flag]
-            
+            # compress_outputs = segment_compress_outputs[mem_flag] if compress_outputs is None else torch.cat([compress_outputs, segment_compress_outputs[mem_flag]], dim=0)
+
             del segment_input_ids, segment_input_embedding
             torch.cuda.empty_cache()
+        #     print("In compress: ")
+        #     os.system("nvidia-smi | grep python")
+        # print("After compress: ")
+        # os.system("nvidia-smi | grep python")
+        
+        return compress_outputs
+    
+    def _compress_target(
+        self,
+        input_ids: torch.LongTensor = None,
+        is_training: bool = True,
+        target_tokens: int = 2000
+    ):  # for inference; compress a fixed length of input into memory slots
+        # print("Before compress: ")
+        # os.system("nvidia-smi | grep python")
+        batch_size = input_ids.size(0)
+        total_length = input_ids.size(1)
+
+        if target_tokens != 0:
+            num_segments = math.floor(target_tokens / self.mem_size)
+            segment_length = math.ceil(total_length / num_segments)
+        else:
+            num_segments = self.compute_num_segments(total_length)
+            segment_length = math.ceil(total_length / num_segments)
+        
+        max_compressed_length = num_segments * self.mem_size
+        compress_outputs = torch.zeros((max_compressed_length, self.dim))
+        # compress_outputs = None
+        
+        for segment_idx in range(num_segments):
+            start_idx = segment_idx * segment_length
+            end_idx = min((segment_idx + 1) * segment_length, total_length)
+            segment_input_ids = input_ids[:, start_idx:end_idx]
+            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence], dim=1)
+            mem_flag = segment_input_ids >= self.vocab_size
+
+            segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)
+            segment_input_embedding[mem_flag] = self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding)
+
+            # compress the current segment
+            if is_training:
+                segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
+            else:
+                with torch.no_grad():
+                    segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
+            segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
+
+            # collect memory tokens
+            compress_outputs[segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = segment_compress_outputs[mem_flag]
+            # compress_outputs = segment_compress_outputs[mem_flag] if compress_outputs is None else torch.cat([compress_outputs, segment_compress_outputs[mem_flag]], dim=0)
+
+            del segment_input_ids, segment_input_embedding
+            torch.cuda.empty_cache()
+        #     print("In compress: ")
+        #     os.system("nvidia-smi | grep python")
+        # print("After compress: ")
+        # os.system("nvidia-smi | grep python")
         
         return compress_outputs
